@@ -10,7 +10,7 @@ export default {
         sans: ['Inter', 'system-ui', 'sans-serif'],
       },
       animation: {
-        'fade-up': 'fadeUp 0.6s ease forwards',
+        'fade-up': 'fadeUp 0.10s ease forwards',
       },
       keyframes: {
         fadeUp: {
