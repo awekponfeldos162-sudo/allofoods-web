@@ -1,0 +1,13 @@
+specVersion: "v1"
+serviceId: "allofoods-5d32b-service"
+location: "us-east4"
+schemas:
+  - source: "./schema"
+    datasource:
+      postgresql:
+        database: "allofoods-5d32b-database"
+        cloudSql:
+          instanceId: "allofoods-5d32b-instance"
+          # schemaValidation: "STRICT"     # STRICT mode makes Postgres schema match Data Connect exactly.
+          # schemaValidation: "COMPATIBLE" # COMPATIBLE mode makes Postgres schema compatible with Data Connect.
+connectorDirs: ["./example"]

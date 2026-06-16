@@ -1,0 +1,355 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // HELPERS
+    // ══════════════════════════════════════════════════════════════════════════
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isDriver() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'driver';
+    }
+
+    function isRestaurantOwner(restaurantId) {
+      return isSignedIn()
+        && restaurantId != null
+        && exists(/databases/$(database)/documents/restaurants/$(restaurantId))
+        && get(/databases/$(database)/documents/restaurants/$(restaurantId)).data.ownerUid == request.auth.uid;
+    }
+
+    // Champs financiers jamais écrits par le client — serveur (Admin SDK) uniquement
+    function touchesFinancialFields(fields) {
+      return fields.hasAny([
+        'paymentStatus', 'restoAmount', 'commission', 'fedaPayTransactionId',
+        'wallet_balance', 'total_earned', 'total_withdrawn', 'deliveryId'
+      ]);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // USERS
+    // ══════════════════════════════════════════════════════════════════════════
+
+    match /users/{uid} {
+      // FAILLE CORRIGÉE : lecture limitée à son propre profil (plus "any auth user = read all")
+      allow read: if isOwner(uid) || isAdmin() || isDriver();
+
+      // Création : uniquement son propre doc, sans élévation de rôle
+      allow create: if isOwner(uid)
+        && !request.resource.data.keys().hasAny(['role', 'appOrigin'])
+        || isAdmin();
+
+      // Modification : champs non-sensibles uniquement
+      allow update: if isOwner(uid)
+        && !request.resource.data.diff(resource.data)
+            .affectedKeys().hasAny(['role', 'appOrigin', 'uid'])
+        || isAdmin();
+
+      allow delete: if isAdmin();
+
+      match /notifications/{id} {
+        allow read, write: if isOwner(uid);
+      }
+
+      // FAILLE CORRIGÉE : delivery_history et earnings ne sont écrits que par le serveur
+      match /delivery_history/{id} {
+        allow read: if isOwner(uid) || isAdmin();
+        allow write: if false; // Cloud Functions (Admin SDK) uniquement
+      }
+
+      match /monthly_earnings/{id} {
+        allow read: if isOwner(uid) || isAdmin();
+        allow write: if false; // Cloud Functions (Admin SDK) uniquement
+      }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ORDERS
+    // ══════════════════════════════════════════════════════════════════════════
+
+    match /orders/{orderId} {
+      allow read: if isSignedIn() && (
+        resource.data.clientUid  == request.auth.uid ||
+        resource.data.deliveryId == request.auth.uid ||
+        isRestaurantOwner(resource.data.restaurantId) ||
+        isAdmin()
+      );
+
+      // Client ne peut pas créer un order pré-payé ou avec champs dangereux
+      allow create: if isSignedIn()
+        && request.resource.data.clientUid == request.auth.uid
+        && request.resource.data.paymentStatus in ['PENDING', 'pending']
+        && request.resource.data.status in ['pending', 'awaiting_payment']
+        // Bloquer uniquement les champs vraiment dangereux (pas restoAmount/commission)
+        && !request.resource.data.keys().hasAny([
+            'fedaPayTransactionId', 'wallet_balance',
+            'total_earned', 'total_withdrawn'
+           ]);
+
+      // Client : annulation uniquement si statut pending (avant paiement)
+      allow update: if isSignedIn()
+        && resource.data.clientUid == request.auth.uid
+        && resource.data.status == 'pending'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+        && request.resource.data.status == 'cancelled';
+
+      // Client : confirmation de paiement FedaPay (awaiting_payment → paid)
+      allow update: if isSignedIn()
+        && resource.data.clientUid == request.auth.uid
+        && resource.data.status == 'awaiting_payment'
+        && resource.data.paymentStatus in ['PENDING', 'pending']
+        && request.resource.data.status == 'paid'
+        && request.resource.data.paymentStatus == 'PAID'
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'paymentStatus', 'fedaPayTransactionId',
+                      'paymentConfirmedAt', 'paidAt', 'updatedAt']);
+
+      // Client : échec de paiement (awaiting_payment → cancelled)
+      allow update: if isSignedIn()
+        && resource.data.clientUid == request.auth.uid
+        && resource.data.status == 'awaiting_payment'
+        && request.resource.data.status == 'cancelled'
+        && request.resource.data.paymentStatus == 'PAYMENT_FAILED'
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'paymentStatus', 'failedAt', 'updatedAt']);
+
+      // Livreur : position + statut livraison uniquement
+      allow update: if isSignedIn()
+        && resource.data.deliveryId == request.auth.uid
+        && isDriver()
+        && !touchesFinancialFields(request.resource.data.diff(resource.data).affectedKeys())
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'driverLocation', 'updatedAt']);
+
+      // Restaurant owner : statut préparation uniquement
+      allow update: if isRestaurantOwner(resource.data.restaurantId)
+        && !touchesFinancialFields(request.resource.data.diff(resource.data).affectedKeys())
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'updatedAt', 'estimatedTime']);
+
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+
+      match /messages/{msgId} {
+        // Seuls les participants de la commande peuvent lire les messages
+        allow read: if isSignedIn() && (
+          get(/databases/$(database)/documents/orders/$(orderId)).data.clientUid == request.auth.uid ||
+          get(/databases/$(database)/documents/orders/$(orderId)).data.deliveryId == request.auth.uid ||
+          isRestaurantOwner(get(/databases/$(database)/documents/orders/$(orderId)).data.restaurantId) ||
+          isAdmin()
+        );
+        allow create: if isSignedIn();
+      }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // RESTAURANTS
+    // ══════════════════════════════════════════════════════════════════════════
+
+    match /restaurants/{restId} {
+      allow read: if true;
+
+      // FAILLE CORRIGÉE : création sans champs financiers ni approbation
+      allow create: if isSignedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && !request.resource.data.keys().hasAny([
+            'wallet_balance', 'total_earned', 'total_withdrawn', 'is_approved'
+           ]);
+
+      // FAILLE CORRIGÉE : owner ne peut pas modifier ses champs financiers
+      allow update: if isRestaurantOwner(restId)
+        && !request.resource.data.diff(resource.data).affectedKeys()
+            .hasAny(['wallet_balance', 'total_earned', 'total_withdrawn',
+                     'is_approved', 'ownerUid'])
+        || isAdmin();
+
+      // Client : rating uniquement
+      allow update: if isSignedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['rating']);
+
+      allow delete: if isAdmin();
+
+      match /reviews/{reviewId} {
+        allow read: if true;
+        allow create: if isSignedIn()
+            && request.resource.data.clientUid == request.auth.uid;
+        allow update, delete: if isSignedIn()
+            && (resource.data.clientUid == request.auth.uid || isAdmin());
+      }
+
+      match /promos/{promoId} {
+        allow read: if isSignedIn();
+
+        allow create: if isSignedIn()
+            && (isAdmin() || isRestaurantOwner(restId))
+            && request.resource.data.usedCount == 0;
+
+        allow delete: if isAdmin() || isRestaurantOwner(restId);
+        allow update: if isAdmin() || isRestaurantOwner(restId);
+
+        // Client : usage unique (usedCount + 1, s'ajouter à usedBy)
+        allow update: if isSignedIn()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['usedCount', 'usedBy'])
+            && request.resource.data.usedCount == resource.data.usedCount + 1
+            && !(request.auth.uid in resource.data.usedBy)
+            && request.resource.data.usedBy.hasAll(resource.data.usedBy)
+            && request.resource.data.usedBy.size() == resource.data.usedBy.size() + 1;
+      }
+    }
+
+    match /{path=**}/reviews/{reviewId} {
+      allow read, write: if isAdmin();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // DRIVERS
+    // ══════════════════════════════════════════════════════════════════════════
+
+    match /drivers/{driverId} {
+      allow read: if isOwner(driverId) || isAdmin() || isDriver();
+      // FAILLE CORRIGÉE : driver ne peut pas modifier ses champs financiers
+      allow write: if (isOwner(driverId)
+        && !touchesFinancialFields(request.resource.data.diff(resource.data).affectedKeys()))
+        || isAdmin();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // CODES PROMO GLOBAUX
+    // ══════════════════════════════════════════════════════════════════════════
+
+    match /promo_codes/{docId} {
+      allow read: if isSignedIn();
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin();
+
+      // Client : usage unique
+      allow update: if isSignedIn()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['usedCount', 'usedBy'])
+          && request.resource.data.usedCount == resource.data.usedCount + 1
+          && !(request.auth.uid in resource.data.usedBy)
+          && request.resource.data.usedBy.hasAll(resource.data.usedBy)
+          && request.resource.data.usedBy.size() == resource.data.usedBy.size() + 1;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // COLLECTIONS FINANCIÈRES — ÉCRITURE SERVEUR UNIQUEMENT
+    // Firebase Admin SDK bypass ces règles → Cloud Functions écrivent librement.
+    // Les clients ne peuvent QUE lire leurs propres données.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // FAILLE CORRIGÉE : plus de write client sur wallet_transactions
+    match /wallet_transactions/{id} {
+      allow read: if isSignedIn() && (
+        resource.data.restaurant_id != null && isRestaurantOwner(resource.data.restaurant_id)
+        || isOwner(resource.data.driver_id)
+        || isAdmin()
+      );
+      allow write: if false; // Cloud Functions (Admin SDK) uniquement
+    }
+
+    match /payout_history/{id} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /payment_logs/{id} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /payout_logs/{id} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /wallets/{walletId} {
+      allow read: if isOwner(walletId) || isAdmin();
+      allow write: if false;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ADMIN & VERROUS SYSTÈME — SERVEUR UNIQUEMENT
+    // ══════════════════════════════════════════════════════════════════════════
+
+    match /admin/{docId} {
+      allow read, write: if isAdmin();
+    }
+
+    // Verrous anti-doublon payout — invisibles aux clients
+    match /payout_locks/{id} {
+      allow read, write: if false;
+    }
+
+    match /auto_payout_queue/{id} {
+      allow read, write: if false;
+    }
+
+    // FAILLE CORRIGÉE : seul admin peut créer une demande de retrait forcé
+    match /withdrawal_requests/{id} {
+      allow read: if isAdmin();
+      allow create: if isAdmin();
+      allow update, delete: if false; // Traité et supprimé par Cloud Function
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // CONTENU PUBLIC
+    // ══════════════════════════════════════════════════════════════════════════
+
+    match /categories/{id}     { allow read: if true; allow write: if isAdmin(); }
+    match /cuisine_types/{id}  { allow read: if true; allow write: if isAdmin(); }
+    match /advertisements/{id} { allow read: if true; allow write: if isAdmin(); }
+    match /config/{docId}      { allow read: if true; allow write: if isAdmin(); }
+
+    match /ratings/{ratingId} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn()
+          && request.resource.data.clientUid == request.auth.uid;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // SUPPORT & LOGS
+    // ══════════════════════════════════════════════════════════════════════════
+
+    match /alerts/{alertId} {
+      allow create: if isSignedIn();
+      allow read, update: if isSignedIn()
+          && (resource.data.uid == request.auth.uid || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    match /support_tickets/{id} {
+      allow create: if isSignedIn();
+      allow read: if isSignedIn()
+          && (resource.data.uid == request.auth.uid || isAdmin());
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /reports/{id} {
+      allow create: if isSignedIn();
+      allow read, update, delete: if isAdmin();
+    }
+
+    // FAILLE CORRIGÉE : audit_logs append-only, non modifiables
+    match /audit_logs/{id} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn();
+      allow update, delete: if false; // Immuables
+    }
+  }
+}
